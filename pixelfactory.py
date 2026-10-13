@@ -2,6 +2,7 @@
 """万能图片格式转换工具（ttkbootstrap 暗色界面 + Pillow + 拖拽支持）"""
 import json
 import os
+import time
 import queue
 import sys
 import threading
@@ -205,6 +206,10 @@ class App:
         self._wrap = 160        # 路径换行宽度
         self._thumb_queue = queue.Queue()
         self.root.after(80, self._poll_thumbs)  # 主线程轮询缩略图结果
+        self._cv_queue = queue.Queue()   # 转换预览帧队列
+        self._cv_busy = False
+        self._cv_dirty = False
+        self.root.after(15, self._cv_poll)      # 60Hz 贴帧循环
         self.count_var = ttkb.StringVar(value="0 个文件")
         ttkb.Label(left, textvariable=self.count_var, font=("Segoe UI", 9),
                    foreground=FG_DIM).pack(anchor="e", pady=(4, 0))
@@ -544,7 +549,7 @@ class App:
         """拖动中节流刷新右侧预览"""
         import time
         now = time.time()
-        if now - getattr(self, "_last_live", 0) < 0.08:
+        if now - getattr(self, "_last_live", 0) < 0.03:
             return
         self._last_live = now
         self._update_converted_preview()
@@ -750,37 +755,79 @@ class App:
         return pv, factor
 
     def _update_converted_preview(self):
-        sel = self._selected_index()
-        if sel is None or self._src_size is None:
+        """异步请求一帧转换预览：主线程只收集参数，合成在后台线程做"""
+        self._cv_dirty = True
+        if getattr(self, "_cv_busy", False):
+            return
+        self._cv_busy = True
+        self._cv_dirty = False
+        params = self._cv_params()
+        if params is None:
+            self._cv_busy = False
             self._show_image(self.preview_converted, None, "")
             return
+        threading.Thread(target=self._cv_worker, args=(params, time.time()),
+                         daemon=True).start()
+
+    def _cv_params(self):
+        sel = self._selected_index()
+        if sel is None or self._src_size is None:
+            return None
         src = self.files[sel]
-        fmt = self._fmt_name()
         try:
             tw = int(self.w_var.get()) if self.w_var.get().strip().isdigit() else 0
             th = int(self.h_var.get()) if self.h_var.get().strip().isdigit() else 0
         except ValueError:
             tw = th = 0
-        mode_text = self.resize_mode_var.get()
         mode = {"不缩放": "", "指定宽度": "w", "指定高度": "h",
-                "适配框(不超过)": "fit", "保证不小于宽×高": "min"}.get(mode_text, "")
+                "适配框(不超过)": "fit", "保证不小于宽×高": "min"}.get(
+                    self.resize_mode_var.get(), "")
+        return (src, self._fmt_name(), mode, tw, th,
+                self._crop_box_image(), self.angle)
+
+    def _cv_worker(self, params, req_time):
+        """后台线程：合成一帧预览（旋转前先缩到显示尺度，运算量最小化）"""
+        src, fmt, mode, tw, th, crop, angle = params
         try:
             pv, factor = self._get_preview_source(src)
-            # 裁剪框和目标尺寸都换算到预览小图坐标系，避免全分辨率运算
-            crop = self._crop_box_image()
-            if crop and factor < 1.0:
-                crop = tuple(round(v * factor) for v in crop)
+            base = pv.copy()
+            if crop:
+                cs = tuple(round(v * factor) for v in crop) if factor < 1 else crop
+                base = base.crop(cs)
             tw_p, th_p = round(tw * factor), round(th * factor)
-            out = compose(pv.copy(), mode, tw_p, th_p,
-                          crop=crop, angle=self.angle, resample=Image.BILINEAR)
-            # 预览信息显示换算回全分辨率的真实输出尺寸
-            real_w = round(out.width / factor)
-            real_h = round(out.height / factor)
-            self._show_image(self.preview_converted, out,
-                             f"{real_w} × {real_h} px  →  {fmt}")
+            # 旋转前先缩到显示尺寸，旋转成本与像素数成正比
+            f2 = min(1.0, 640 / max(base.size)) if base.size else 1.0
+            if f2 < 1.0:
+                base = base.resize((max(1, round(base.width * f2)),
+                                    max(1, round(base.height * f2))), Image.BILINEAR)
+            out = compose(base, mode, round(tw_p * f2), round(th_p * f2),
+                          crop=None, angle=angle, resample=Image.BILINEAR)
+            denom = factor * f2
+            self._cv_queue.put((req_time, out,
+                                round(out.width / denom), round(out.height / denom), fmt))
         except Exception as e:
-            self._show_image(self.preview_converted, None, "")
-            self.preview_converted["info"].set(f"预览失败: {e}")
+            self._cv_queue.put((req_time, None, 0, 0, str(e)))
+
+    def _cv_poll(self):
+        """主线程 60Hz 轮询：只贴最新帧，过期帧直接丢弃"""
+        latest = None
+        try:
+            while True:
+                latest = self._cv_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if latest is not None:
+            _req, out, rw, rh, fmt = latest
+            if out is None:
+                self._show_image(self.preview_converted, None, "")
+                self.preview_converted["info"].set(f"预览失败: {fmt}")
+            else:
+                self._show_image(self.preview_converted, out,
+                                 f"{rw} × {rh} px  →  {fmt}")
+            self._cv_busy = False
+            if self._cv_dirty:
+                self._update_converted_preview()
+        self.root.after(15, self._cv_poll)
 
     def _on_select(self, _event=None):
         sel = self._selected_index()
