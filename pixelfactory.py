@@ -423,19 +423,32 @@ class App:
         return (x0 + f[0] * w, y0 + f[1] * h, x0 + f[2] * w, y0 + f[3] * h, x0, y0, w, h)
 
     def _hit_handle(self, mx, my, g):
-        import math
         x0, y0, x1, y1 = g[0], g[1], g[2], g[3]
-        r = self.HANDLE + 3
+        r = 10  # 命中半径，比视觉控制点大一圈，好抓
         pts = {
-            "nw": (x0, y0), "n": ((x0 + x1) / 2, y0), "ne": (x1, y0),
+            "nw": (x0, y0), "ne": (x1, y0), "sw": (x0, y1), "se": (x1, y1),
+            "n": ((x0 + x1) / 2, y0), "s": ((x0 + x1) / 2, y1),
             "w": (x0, (y0 + y1) / 2), "e": (x1, (y0 + y1) / 2),
-            "sw": (x0, y1), "s": ((x0 + x1) / 2, y1), "se": (x1, y1),
         }
-        for name, (px, py) in pts.items():
+        # 角优先
+        for name in ("nw", "ne", "sw", "se"):
+            px, py = pts[name]
             if abs(mx - px) <= r and abs(my - py) <= r:
                 return name
-        if x0 <= mx <= x1 and y0 <= my <= y1:
+        for name in ("n", "s", "w", "e"):
+            px, py = pts[name]
+            if abs(mx - px) <= r and abs(my - py) <= r:
+                return name
+        inside = x0 <= mx <= x1 and y0 <= my <= y1
+        near_edge = (x0 - 6 <= mx <= x1 + 6 and y0 - 6 <= my <= y1 + 6)
+        if inside:
             return "move"
+        if near_edge:
+            # 在框边缘外侧一点：按最近的边处理，而不是重新框选
+            import math
+            name = min(("n", "s", "w", "e"),
+                       key=lambda n: math.dist((mx, my), pts[n]))
+            return name
         return None
 
     def _crop_press(self, event, canvas):
@@ -450,9 +463,10 @@ class App:
             self._crop_drag = {"mode": hit, "start": (event.x, event.y),
                                "rect": [x0, y0, x1, y1]}
         else:
-            # 在外部按下：重新框选
+            # 在框外较远处按下：重新框选（记住旧框，误触可恢复）
             self._crop_drag = {"mode": "new", "start": (event.x, event.y),
-                               "rect": [event.x, event.y, event.x, event.y]}
+                               "rect": [event.x, event.y, event.x, event.y],
+                               "prev_frac": self.crop_frac}
             self.crop_frac = None
             self._draw_drag_rect(canvas, event.x, event.y, event.x, event.y)
 
@@ -499,7 +513,13 @@ class App:
 
     def _crop_release(self, _event):
         if self._crop_drag:
+            drag = self._crop_drag
             self._crop_drag = None
+            # 误触重选（几乎没拖动）：恢复原框，避免框莫名其妙消失
+            if drag["mode"] == "new":
+                r = drag["rect"]
+                if r[2] - r[0] < 6 or r[3] - r[1] < 6:
+                    self.crop_frac = drag.get("prev_frac") or (0.1, 0.1, 0.9, 0.9)
             self._render_pane(self.preview_original)
             self._update_converted_preview()
 
