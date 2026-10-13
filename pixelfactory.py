@@ -89,6 +89,17 @@ def build_output_image(src: str, fmt_name: str, quality: int,
         return compose(first, resize_mode, target_w, target_h, crop, angle)
 
 
+def unique_path(dst: str) -> str:
+    """目标文件已存在时自动加序号：name(1).jpg、name(2).jpg…"""
+    if not os.path.exists(dst):
+        return dst
+    base, ext = os.path.splitext(dst)
+    i = 1
+    while os.path.exists(f"{base}({i}){ext}"):
+        i += 1
+    return f"{base}({i}){ext}"
+
+
 def convert_one(src: str, dst: str, fmt_name: str, quality: int,
                 resize_mode: str, target_w: int, target_h: int) -> None:
     out = build_output_image(src, fmt_name, quality, resize_mode, target_w, target_h)
@@ -207,6 +218,7 @@ class App:
         self._thumb_queue = queue.Queue()
         self.root.after(80, self._poll_thumbs)  # 主线程轮询缩略图结果
         self._cv_queue = queue.Queue()   # 转换预览帧队列
+        self._prog_queue = queue.Queue() # 转换进度队列（工作线程只生产）
         self._cv_busy = False
         self._cv_dirty = False
         self.root.after(15, self._cv_poll)      # 60Hz 贴帧循环
@@ -629,6 +641,7 @@ class App:
             self.selected = self.files.index(path)
             self._render_list()
             self.status_var.set(path)
+            self._update_out_text()
             self._update_preview()
 
     def _load_thumb(self, path):
@@ -809,7 +822,16 @@ class App:
             self._cv_queue.put((req_time, None, 0, 0, str(e)))
 
     def _cv_poll(self):
-        """主线程 60Hz 轮询：只贴最新帧，过期帧直接丢弃"""
+        """主线程 60Hz 轮询：贴最新预览帧 + 消费转换进度"""
+        try:
+            while True:
+                msg = self._prog_queue.get_nowait()
+                if msg[0] == "prog":
+                    self._progress_update(*msg[1:])
+                else:
+                    self._finished(*msg[1:])
+        except queue.Empty:
+            pass
         latest = None
         try:
             while True:
@@ -966,11 +988,19 @@ class App:
             self._save_config()
 
     def _update_out_text(self):
-        """路径超长时中间截断，独占一整行显示"""
+        """输出目录显示：明确指定则显示指定目录；
+        未指定则跟随当前选中图片的原目录（随选择实时变动）"""
         prow = self.out_label.master
         avail = prow.winfo_width() - 90  # 减去「输出目录:」前缀宽度
         font = tkfont.Font(font=self.out_label.cget("font"))
-        text = self.out_full
+        if self.out_dir:
+            text = self.out_full
+        else:
+            sel = self._selected_index()
+            if sel is not None:
+                text = f"原目录（跟随所选图片）：{os.path.dirname(self.files[sel])}"
+            else:
+                text = "默认：与原文件同目录（未选择图片）"
         if avail > 40 and font.measure(text) > avail:
             keep = len(text) // 2
             while keep > 4 and font.measure(text[:keep] + " … " + text[-keep:]) > avail:
@@ -1027,7 +1057,7 @@ class App:
             os.makedirs(self.out_dir, exist_ok=True)
         for i, src in enumerate(self.files, 1):
             name = os.path.splitext(os.path.basename(src))[0] + ext
-            dst = os.path.join(self.out_dir or os.path.dirname(src), name)
+            dst = unique_path(os.path.join(self.out_dir or os.path.dirname(src), name))
             try:
                 if (os.path.abspath(src) == os.path.abspath(dst)
                         and os.path.splitext(src)[1].lower() == ext):
@@ -1038,8 +1068,8 @@ class App:
             except Exception as e:
                 print(f"失败: {src} -> {e}", file=sys.stderr)
                 fail += 1
-            self.root.after(0, self._progress_update, i, ok, fail, skip)
-        self.root.after(0, self._finished, ok, fail, skip)
+            self._prog_queue.put(("prog", i, ok, fail, skip))
+        self._prog_queue.put(("done", ok, fail, skip))
 
     def _progress_update(self, done, ok, fail, skip):
         self.progress["value"] = done
@@ -1162,7 +1192,7 @@ def run_cli(argv):
         os.makedirs(out_dir, exist_ok=True)
     for f in files:
         name = os.path.splitext(os.path.basename(f))[0] + ext
-        dst = os.path.join(out_dir if out_dir else os.path.dirname(f), name)
+        dst = unique_path(os.path.join(out_dir if out_dir else os.path.dirname(f), name))
         try:
             convert_one(f, dst, fmt, 90, mode, tw, th)
             ok += 1
