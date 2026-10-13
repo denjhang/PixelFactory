@@ -48,10 +48,19 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 
 def build_output_image(src: str, fmt_name: str, quality: int,
-                       resize_mode: str, target_w: int, target_h: int) -> Image.Image:
-    """按当前设置生成输出图像（内存中，供保存与预览共用）"""
+                       resize_mode: str, target_w: int, target_h: int,
+                       crop=None, angle: float = 0.0) -> Image.Image:
+    """按当前设置生成输出图像（内存中，供保存与预览共用）
+    crop: 原图像素坐标 (left, top, right, bottom)；angle: 旋转角度（度，正值顺时针）"""
     with Image.open(src) as im:
         first = im.convert("RGBA") if im.mode != "RGBA" else im.copy()
+
+        # ── 裁剪 → 旋转（先定构图再修正倾斜） ──
+        if crop:
+            first = first.crop(crop)
+        if angle:
+            first = first.rotate(-angle, resample=Image.BICUBIC, expand=True,
+                                 fillcolor=(0, 0, 0, 0))
 
         # ── 缩放（均保持宽高比例） ──
         w, h = first.size
@@ -120,14 +129,33 @@ class App:
         style.configure('TFrame', background=BG)
         style.configure('TLabel', background=BG, foreground=FG)
 
-        # 标题
-        header = ttkb.Frame(r, padding=(24, 18, 24, 6))
-        header.pack(fill=X)
-        ttkb.Label(header, text="图片格式转换", font=("Segoe UI Semibold", 20),
-                   foreground=FG).pack(side=LEFT)
-        ttkb.Label(header, text="  WebP / JPG / PNG / GIF / BMP / TIFF 互转",
-                   font=("Segoe UI", 10), foreground=FG_DIM,
-).pack(side=LEFT, pady=(8, 0))
+        # 工具栏（取代标题）
+        tb = ttkb.Frame(r, padding=(24, 12, 24, 4))
+        tb.pack(fill=X)
+        self.btn_crop = ttkb.Button(tb, text="✂ 框选裁剪", bootstyle="primary-outline",
+                                    command=self.toggle_crop)
+        self.btn_crop.pack(side=LEFT, padx=(0, 8))
+        self.btn_rotate = ttkb.Button(tb, text="⟲ 旋转校正", bootstyle="primary-outline",
+                                      command=self.toggle_rotate)
+        self.btn_rotate.pack(side=LEFT, padx=(0, 16))
+        # 角度调整条（点击「旋转校正」后出现）
+        self.angle_bar = ttkb.Frame(tb)
+        ttkb.Label(self.angle_bar, text="角度", font=("Segoe UI", 9),
+                   foreground=FG_DIM).pack(side=LEFT, padx=(0, 6))
+        self.angle_var = ttkb.DoubleVar(value=0.0)
+        self.angle_scale = ttkb.Scale(self.angle_bar, from_=-45, to=45,
+                                      value=0, length=220, bootstyle="info",
+                                      command=self._on_angle)
+        self.angle_scale.pack(side=LEFT)
+        self.angle_entry = ttkb.Entry(self.angle_bar, width=8, font=("Consolas", 10))
+        self.angle_entry.insert(0, "0.00")
+        self.angle_entry.pack(side=LEFT, padx=(8, 0))
+        self.angle_entry.bind("<Return>", self._on_angle_entry)
+        self.angle_entry.bind("<FocusOut>", self._on_angle_entry)
+        ttkb.Button(self.angle_bar, text="归零", width=4, bootstyle="secondary-outline",
+                    command=self._angle_reset).pack(side=LEFT, padx=(8, 0))
+        ttkb.Label(tb, text="拖入图片即可开始 · WebP/JPG/PNG/GIF/BMP/TIFF 互转",
+                   font=("Segoe UI", 9), foreground=FG_DIM).pack(side=RIGHT, pady=(8, 0))
 
         # ── 三栏主区：文件列表 | 原图预览 | 转换后预览 ──
         main = ttkb.Frame(r)
@@ -191,7 +219,12 @@ class App:
 
         self._preview_imgs = {}  # 防止 PhotoImage 被回收
         self._pane_src = {}      # 各面板当前完整图像（供重绘）
+        self._pane_disp = {}     # 各面板图像显示区域 (x, y, w, h)
         self._src_size = None    # 当前选中原图尺寸
+        self.crop_mode = False   # 框选裁剪模式
+        self.crop_frac = None    # 裁剪框（原图比例坐标 0~1）
+        self._crop_drag = None   # 拖拽状态
+        self.angle = 0.0         # 旋转角度（度，正值顺时针）
 
         # 选项区：输出格式 / 尺寸 / 质量 / 输出目录
         opts = ttkb.Frame(r, padding=(24, 8, 24, 0))
@@ -306,6 +339,217 @@ class App:
         self.add_files(files)
 
     # ────────────────── 交互 ──────────────────
+    # ────────────────── 工具栏：框选裁剪 / 旋转校正 ──────────────────
+    def toggle_crop(self):
+        self.crop_mode = not self.crop_mode
+        self.btn_crop.config(bootstyle="primary" if self.crop_mode
+                             else "primary-outline")
+        if self.crop_mode:
+            # 默认框选中间 80%
+            self.crop_frac = (0.1, 0.1, 0.9, 0.9)
+            self.status_var.set("裁剪模式：拖动边角调整，拖内部移动，点外部重新框选")
+        else:
+            self.crop_frac = None
+            self.status_var.set("已退出裁剪模式")
+        self._render_pane(self.preview_original)
+        self._update_converted_preview()
+
+    def toggle_rotate(self):
+        if self.angle_bar.winfo_ismapped():
+            self.angle_bar.pack_forget()
+            self.btn_rotate.config(bootstyle="primary-outline")
+            self._angle_reset()
+        else:
+            self.angle_bar.pack(side=LEFT)
+            self.btn_rotate.config(bootstyle="info")
+            self.status_var.set("拖动角度条或输入精确角度（保留两位小数），正值顺时针")
+
+    def _on_angle(self, _=None):
+        self.angle = round(float(self.angle_scale.get()), 2)
+        self._sync_angle_entry()
+        self._live_crop_preview()
+
+    def _on_angle_entry(self, _event=None):
+        try:
+            v = max(-180.0, min(180.0, float(self.angle_entry.get())))
+        except ValueError:
+            v = 0.0
+        self.angle = round(v, 2)
+        self.angle_scale.set(self.angle)
+        self._sync_angle_entry()
+        self._update_converted_preview()
+
+    def _angle_reset(self):
+        self.angle = 0.0
+        self.angle_scale.set(0)
+        self._sync_angle_entry()
+        self._update_converted_preview()
+
+    def _sync_angle_entry(self):
+        self.angle_entry.delete(0, END)
+        self.angle_entry.insert(0, f"{self.angle:.2f}")
+
+    # ── 裁剪框交互（iPhone 风格：8 个控制点 + 内部拖动 + 外部重选） ──
+    HANDLE = 5  # 控制点半径（像素）
+
+    def _bind_crop_events(self, canvas):
+        canvas.bind("<Button-1>", lambda e: self._crop_press(e, canvas))
+        canvas.bind("<B1-Motion>", lambda e: self._crop_drag_motion(e, canvas))
+        canvas.bind("<ButtonRelease-1>", lambda e: self._crop_release(e))
+
+    def _crop_geom(self, canvas):
+        """当前裁剪框的画布坐标 (x0,y0,x1,y1, ix,iy,iw,ih)"""
+        d = self._pane_disp.get(id(self.preview_original["canvas"]))
+        if not d:
+            return None
+        x0, y0, w, h = d
+        f = self.crop_frac or (0.1, 0.1, 0.9, 0.9)
+        return (x0 + f[0] * w, y0 + f[1] * h, x0 + f[2] * w, y0 + f[3] * h, x0, y0, w, h)
+
+    def _hit_handle(self, mx, my, g):
+        import math
+        x0, y0, x1, y1 = g[0], g[1], g[2], g[3]
+        r = self.HANDLE + 3
+        pts = {
+            "nw": (x0, y0), "n": ((x0 + x1) / 2, y0), "ne": (x1, y0),
+            "w": (x0, (y0 + y1) / 2), "e": (x1, (y0 + y1) / 2),
+            "sw": (x0, y1), "s": ((x0 + x1) / 2, y1), "se": (x1, y1),
+        }
+        for name, (px, py) in pts.items():
+            if abs(mx - px) <= r and abs(my - py) <= r:
+                return name
+        if x0 <= mx <= x1 and y0 <= my <= y1:
+            return "move"
+        return None
+
+    def _crop_press(self, event, canvas):
+        if not self.crop_mode:
+            return
+        g = self._crop_geom(canvas)
+        if g is None:
+            return
+        x0, y0, x1, y1 = g[:4]
+        hit = self._hit_handle(event.x, event.y, g)
+        if hit:
+            self._crop_drag = {"mode": hit, "start": (event.x, event.y),
+                               "rect": [x0, y0, x1, y1]}
+        else:
+            # 在外部按下：重新框选
+            self._crop_drag = {"mode": "new", "start": (event.x, event.y),
+                               "rect": [event.x, event.y, event.x, event.y]}
+            self.crop_frac = None
+            self._draw_drag_rect(canvas, event.x, event.y, event.x, event.y)
+
+    def _crop_drag_motion(self, event, canvas):
+        if not self._crop_drag:
+            return
+        mode = self._crop_drag["mode"]
+        r = list(self._crop_drag["rect"])
+        d = self._pane_disp.get(id(self.preview_original["canvas"]))
+        if not d:
+            return
+        ix, iy, iw, ih = d
+        mx, my = event.x, event.y
+        # 限制在图像范围内
+        mx = min(max(mx, ix), ix + iw)
+        my = min(max(my, iy), iy + ih)
+        if mode == "move":
+            dx = mx - self._crop_drag["start"][0]
+            dy = my - self._crop_drag["start"][1]
+            w = r[2] - r[0]
+            h = r[3] - r[1]
+            nx0 = min(max(r[0] + dx, ix), ix + iw - w)
+            ny0 = min(max(r[1] + dy, iy), iy + ih - h)
+            r = [nx0, ny0, nx0 + w, ny0 + h]
+        elif mode == "new":
+            sx, sy = self._crop_drag["start"]
+            r = [min(sx, mx), min(sy, my), max(sx, mx), max(sy, my)]
+        else:
+            if "w" in mode:
+                r[0] = min(mx, r[2] - 8)
+            if "e" in mode:
+                r[2] = max(mx, r[0] + 8)
+            if "n" in mode:
+                r[1] = min(my, r[3] - 8)
+            if "s" in mode:
+                r[3] = max(my, r[1] + 8)
+        self._crop_drag["rect"] = r
+        self.crop_frac = ((r[0] - ix) / iw, (r[1] - iy) / ih,
+                          (r[2] - ix) / iw, (r[3] - iy) / ih)
+        # 图像区域外残余
+        fx, fy, fw, fh = d
+        self._draw_crop_overlay(canvas, fx, fy, fw, fh, drag_rect=r)
+        self._live_crop_preview()
+
+    def _crop_release(self, _event):
+        if self._crop_drag:
+            self._crop_drag = None
+            self._render_pane(self.preview_original)
+            self._update_converted_preview()
+
+    def _draw_drag_rect(self, canvas, x0, y0, x1, y1):
+        canvas.delete("crop")
+        canvas.create_rectangle(x0, y0, x1, y1, outline=ACCENT, width=2, tags="crop")
+
+    def _draw_crop_overlay(self, canvas, ix, iy, iw, ih, drag_rect=None):
+        """图像四周压暗 + 裁剪框 + 8 个控制点"""
+        canvas.delete("crop")
+        if drag_rect is None:
+            f = self.crop_frac
+            if not f:
+                return
+            rx0, ry0 = ix + f[0] * iw, iy + f[1] * ih
+            rx1, ry1 = ix + f[2] * iw, iy + f[3] * ih
+        else:
+            rx0, ry0, rx1, ry1 = drag_rect
+        # 四周压暗
+        dim = dict(fill="#000000", stipple="gray50", outline="", tags="crop")
+        canvas.create_rectangle(ix, iy, ix + iw, ry0, **dim)
+        canvas.create_rectangle(ix, ry1, ix + iw, iy + ih, **dim)
+        canvas.create_rectangle(ix, ry0, rx0, ry1, **dim)
+        canvas.create_rectangle(rx1, ry0, ix + iw, ry1, **dim)
+        # 三分线（构图参考）
+        for t in (1 / 3, 2 / 3):
+            canvas.create_line(rx0 + (rx1 - rx0) * t, ry0, rx0 + (rx1 - rx0) * t, ry1,
+                               fill="#ffffff", stipple="gray25", tags="crop")
+            canvas.create_line(rx0, ry0 + (ry1 - ry0) * t, rx1, ry0 + (ry1 - ry0) * t,
+                               fill="#ffffff", stipple="gray25", tags="crop")
+        canvas.create_rectangle(rx0, ry0, rx1, ry1, outline=ACCENT, width=2,
+                                tags="crop")
+        # 8 个控制点
+        pts = [(rx0, ry0), ((rx0 + rx1) / 2, ry0), (rx1, ry0),
+               (rx0, (ry0 + ry1) / 2), (rx1, (ry0 + ry1) / 2),
+               (rx0, ry1), ((rx0 + rx1) / 2, ry1), (rx1, ry1)]
+        for px, py in pts:
+            canvas.create_rectangle(px - self.HANDLE, py - self.HANDLE,
+                                    px + self.HANDLE, py + self.HANDLE,
+                                    fill="#ffffff", outline=ACCENT, width=1,
+                                    tags="crop")
+
+    def _crop_box_image(self):
+        """把裁剪框换算成原图像素坐标 (left, top, right, bottom)，无则 None"""
+        if not (self.crop_mode and self.crop_frac):
+            return None
+        w, h = self._src_size or (0, 0)
+        if not w:
+            return None
+        f = self.crop_frac
+        l, t = min(f[0], f[2]) * w, min(f[1], f[3]) * h
+        r, b = max(f[0], f[2]) * w, max(f[1], f[3]) * h
+        box = (round(l), round(t), round(r), round(b))
+        if box[2] - box[0] < 2 or box[3] - box[1] < 2:
+            return None
+        return box
+
+    def _live_crop_preview(self):
+        """拖动中节流刷新右侧预览"""
+        import time
+        now = time.time()
+        if now - getattr(self, "_last_live", 0) < 0.08:
+            return
+        self._last_live = now
+        self._update_converted_preview()
+
     def _on_quality(self, _=None):
         self.q_label.config(text=str(int(float(self.scale.get()))))
         self._update_converted_preview()
@@ -409,34 +653,37 @@ class App:
             pass
         self.root.after(80, self._poll_thumbs)
 
-    # ────────────────── 预览面板 ──────────────────
+    # ────────────────── 预览面板（Canvas，支持裁剪框） ──────────────────
     def _make_preview_pane(self, parent, title: str):
         pane = ttkb.Frame(parent)
         pane.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 12))
         ttkb.Label(pane, text=title, font=("Segoe UI Semibold", 11),
                    foreground=FG_DIM).pack(anchor=W, pady=(0, 6))
-        # 棋盘格底，便于观察透明区域
         holder = tk.Frame(pane, bg="#2a2d3a", highlightthickness=1,
                           highlightbackground="#31354a")
         holder.pack(fill=BOTH, expand=True)
-        img_label = tk.Label(holder, bg="#2a2d3a", bd=0,
-                             text="（未选择）", fg=FG_DIM,
-                             font=("Segoe UI", 10))
-        img_label.place(relx=0.5, rely=0.5, anchor="center")
+        canvas = tk.Canvas(holder, bg="#2a2d3a", highlightthickness=0, bd=0,
+                           cursor="crosshair" if title == "原图预览" else "arrow")
+        canvas.pack(fill=BOTH, expand=True)
         info_var = ttkb.StringVar(value="—")
         ttkb.Label(pane, textvariable=info_var, font=("Consolas", 10),
                    foreground=ACCENT).pack(anchor=W, pady=(6, 0))
-        p = {"holder": holder, "label": img_label, "info": info_var}
+        p = {"holder": holder, "canvas": canvas, "info": info_var}
         holder.bind("<Configure>", lambda _e, p=p: self._render_pane(p))
+        if title == "原图预览":
+            self._bind_crop_events(canvas)
         return p
 
     PREVIEW_MAX = 560
 
     def _show_image(self, pane, im: Image.Image | None, caption: str):
         key = id(pane)
+        canvas = pane["canvas"]
+        canvas.delete("all")
         if im is None:
             self._pane_src.pop(key, None)
-            pane["label"].config(image="", text="（未选择）")
+            canvas.create_text(20, 20, anchor=NW, text="（未选择）",
+                               fill=FG_DIM, font=("Segoe UI", 10))
             pane["info"].set(caption or "—")
             return
         self._pane_src[key] = im.convert("RGBA")
@@ -444,19 +691,28 @@ class App:
         pane["info"].set(caption)
 
     def _render_pane(self, pane):
+        canvas = pane["canvas"]
+        canvas.delete("all")
         im = self._pane_src.get(id(pane))
-        label = pane["label"]
         if im is None:
+            canvas.create_text(20, 20, anchor=NW, text="（未选择）",
+                               fill=FG_DIM, font=("Segoe UI", 10))
             return
         # 跟随面板实际大小缩放，窗口再小也不会撑爆布局
-        max_w = max(label.master.winfo_width() - 12, 60)
-        max_h = max(label.master.winfo_height() - 12, 60)
+        max_w = max(canvas.winfo_width() - 12, 60)
+        max_h = max(canvas.winfo_height() - 12, 60)
         disp = im.copy()
         disp.thumbnail((min(self.PREVIEW_MAX, max_w), min(self.PREVIEW_MAX, max_h)),
                        Image.LANCZOS)
         photo = ImageTk.PhotoImage(disp)
         self._preview_imgs[id(pane)] = photo
-        label.config(image=photo, text="")
+        x = max((canvas.winfo_width() - disp.width) // 2, 6)
+        y = max((canvas.winfo_height() - disp.height) // 2, 6)
+        canvas.create_image(x, y, anchor=NW, image=photo)
+        # 记录显示区域，供裁剪框坐标换算
+        self._pane_disp[id(pane)] = (x, y, disp.width, disp.height)
+        if pane is self.preview_original and self.crop_mode and self.crop_frac:
+            self._draw_crop_overlay(canvas, x, y, disp.width, disp.height)
 
     def _update_preview(self):
         sel = self._selected_index()
@@ -493,7 +749,9 @@ class App:
                 "适配框(不超过)": "fit", "保证不小于宽×高": "min"}.get(mode_text, "")
         try:
             out = build_output_image(src, fmt, int(float(self.scale.get())),
-                                     mode, tw, th)
+                                     mode, tw, th,
+                                     crop=self._crop_box_image(),
+                                     angle=self.angle)
             self._show_image(self.preview_converted, out,
                              f"{out.size[0]} × {out.size[1]} px  →  {fmt}")
         except Exception as e:
