@@ -47,46 +47,45 @@ CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 
+def compose(first: Image.Image, resize_mode: str, tw: int, th: int,
+            crop=None, angle: float = 0.0, resample=Image.BICUBIC) -> Image.Image:
+    """在已解码图像上执行 裁剪 → 旋转 → 缩放（纯内存，供预览与保存共用）
+    预览传 resample=Image.BILINEAR 换流畅度；保存用默认 BICUBIC 保画质"""
+    # ── 裁剪 → 旋转（先定构图再修正倾斜） ──
+    if crop:
+        first = first.crop(crop)
+    if angle:
+        first = first.rotate(-angle, resample=resample, expand=True,
+                             fillcolor=(0, 0, 0, 0))
+
+    # ── 缩放（均保持宽高比例） ──
+    w, h = first.size
+    if resize_mode == "w" and tw > 0:
+        th = max(1, round(h * tw / w))
+        first = first.resize((tw, th), Image.LANCZOS)
+    elif resize_mode == "h" and th > 0:
+        tw = max(1, round(w * th / h))
+        first = first.resize((tw, th), Image.LANCZOS)
+    elif resize_mode == "fit" and (tw > 0 or th > 0):
+        tw = tw or th * w // h
+        th = th or tw * h // w
+        ratio = min(tw / w, th / h)
+        first = first.resize((max(1, round(w * ratio)), max(1, round(h * ratio))), Image.LANCZOS)
+    elif resize_mode == "min" and tw > 0 and th > 0:
+        # 短边也要达到目标，保证结果宽高同时 ≥ 指定值，可能超出但绝不小于
+        ratio = max(tw / w, th / h)
+        first = first.resize((max(1, round(w * ratio)), max(1, round(h * ratio))), Image.LANCZOS)
+    return first
+
+
 def build_output_image(src: str, fmt_name: str, quality: int,
                        resize_mode: str, target_w: int, target_h: int,
                        crop=None, angle: float = 0.0) -> Image.Image:
-    """按当前设置生成输出图像（内存中，供保存与预览共用）
+    """按当前设置生成输出图像（全分辨率，供最终保存用）
     crop: 原图像素坐标 (left, top, right, bottom)；angle: 旋转角度（度，正值顺时针）"""
     with Image.open(src) as im:
         first = im.convert("RGBA") if im.mode != "RGBA" else im.copy()
-
-        # ── 裁剪 → 旋转（先定构图再修正倾斜） ──
-        if crop:
-            first = first.crop(crop)
-        if angle:
-            first = first.rotate(-angle, resample=Image.BICUBIC, expand=True,
-                                 fillcolor=(0, 0, 0, 0))
-
-        # ── 缩放（均保持宽高比例） ──
-        w, h = first.size
-        tw, th = target_w, target_h
-        if resize_mode == "w" and tw > 0:
-            th = max(1, round(h * tw / w))
-            first = first.resize((tw, th), Image.LANCZOS)
-        elif resize_mode == "h" and th > 0:
-            tw = max(1, round(w * th / h))
-            first = first.resize((tw, th), Image.LANCZOS)
-        elif resize_mode == "fit" and (tw > 0 or th > 0):
-            tw = tw or th * w // h
-            th = th or tw * h // w
-            ratio = min(tw / w, th / h)
-            first = first.resize((max(1, round(w * ratio)), max(1, round(h * ratio))), Image.LANCZOS)
-        elif resize_mode == "min" and tw > 0 and th > 0:
-            # 短边也要达到目标，保证结果宽高同时 ≥ 指定值，可能超出但绝不小于
-            ratio = max(tw / w, th / h)
-            first = first.resize((max(1, round(w * ratio)), max(1, round(h * ratio))), Image.LANCZOS)
-
-        # ── 透明通道处理 ──
-        if not _supports_alpha(fmt_name) and first.mode == "RGBA":
-            bg = Image.new("RGB", first.size, (255, 255, 255))
-            bg.paste(first, mask=first.split()[-1])
-            return bg
-        return first
+        return compose(first, resize_mode, target_w, target_h, crop, angle)
 
 
 def convert_one(src: str, dst: str, fmt_name: str, quality: int,
@@ -732,6 +731,24 @@ class App:
             self.preview_original["info"].set(f"无法预览: {e}")
         self._update_converted_preview()
 
+    PREVIEW_SRC_MAX = 1000  # 预览管线的源图上限（与全分辨率保存分离）
+
+    def _get_preview_source(self, src: str):
+        """当前文件的降采样 RGBA 副本（缓存），返回 (图, 缩放系数)"""
+        cache = getattr(self, "_pv_src", None)
+        if cache and cache[0] == src:
+            return cache[1], cache[2]
+        with Image.open(src) as im:
+            full = im.convert("RGBA")
+        factor = 1.0
+        pv = full
+        if max(full.size) > self.PREVIEW_SRC_MAX:
+            factor = self.PREVIEW_SRC_MAX / max(full.size)
+            pv = full.resize((round(full.width * factor), round(full.height * factor)),
+                             Image.BILINEAR)
+        self._pv_src = (src, pv, factor)
+        return pv, factor
+
     def _update_converted_preview(self):
         sel = self._selected_index()
         if sel is None or self._src_size is None:
@@ -748,12 +765,19 @@ class App:
         mode = {"不缩放": "", "指定宽度": "w", "指定高度": "h",
                 "适配框(不超过)": "fit", "保证不小于宽×高": "min"}.get(mode_text, "")
         try:
-            out = build_output_image(src, fmt, int(float(self.scale.get())),
-                                     mode, tw, th,
-                                     crop=self._crop_box_image(),
-                                     angle=self.angle)
+            pv, factor = self._get_preview_source(src)
+            # 裁剪框和目标尺寸都换算到预览小图坐标系，避免全分辨率运算
+            crop = self._crop_box_image()
+            if crop and factor < 1.0:
+                crop = tuple(round(v * factor) for v in crop)
+            tw_p, th_p = round(tw * factor), round(th * factor)
+            out = compose(pv.copy(), mode, tw_p, th_p,
+                          crop=crop, angle=self.angle, resample=Image.BILINEAR)
+            # 预览信息显示换算回全分辨率的真实输出尺寸
+            real_w = round(out.width / factor)
+            real_h = round(out.height / factor)
             self._show_image(self.preview_converted, out,
-                             f"{out.size[0]} × {out.size[1]} px  →  {fmt}")
+                             f"{real_w} × {real_h} px  →  {fmt}")
         except Exception as e:
             self._show_image(self.preview_converted, None, "")
             self.preview_converted["info"].set(f"预览失败: {e}")
