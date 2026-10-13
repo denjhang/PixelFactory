@@ -399,7 +399,7 @@ class App:
 
     def _crop_geom(self, canvas):
         """当前裁剪框的画布坐标 (x0,y0,x1,y1, ix,iy,iw,ih)"""
-        d = self._pane_disp.get(id(self.preview_original["canvas"]))
+        d = self._pane_disp.get(id(self.preview_original))
         if not d:
             return None
         x0, y0, w, h = d
@@ -445,7 +445,7 @@ class App:
             return
         mode = self._crop_drag["mode"]
         r = list(self._crop_drag["rect"])
-        d = self._pane_disp.get(id(self.preview_original["canvas"]))
+        d = self._pane_disp.get(id(self.preview_original))
         if not d:
             return
         ix, iy, iw, ih = d
