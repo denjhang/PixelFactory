@@ -101,8 +101,15 @@ def unique_path(dst: str) -> str:
 
 
 def convert_one(src: str, dst: str, fmt_name: str, quality: int,
-                resize_mode: str, target_w: int, target_h: int) -> None:
-    out = build_output_image(src, fmt_name, quality, resize_mode, target_w, target_h)
+                resize_mode: str, target_w: int, target_h: int,
+                crop=None, angle: float = 0.0) -> None:
+    out = build_output_image(src, fmt_name, quality, resize_mode, target_w, target_h,
+                             crop=crop, angle=angle)
+    # JPG/BMP/ICO 不支持透明通道，透明区域填白底
+    if not _supports_alpha(fmt_name) and out.mode == "RGBA":
+        bg = Image.new("RGB", out.size, (255, 255, 255))
+        bg.paste(out, mask=out.split()[-1])
+        out = bg
     save_kwargs = {}
     if fmt_name == "JPEG":
         save_kwargs = {"quality": quality, "subsampling": 0 if quality >= 92 else 2}
@@ -461,11 +468,12 @@ class App:
         hit = self._hit_handle(event.x, event.y, g)
         if hit:
             self._crop_drag = {"mode": hit, "start": (event.x, event.y),
-                               "rect": [x0, y0, x1, y1]}
+                               "rect": [x0, y0, x1, y1], "rect0": [x0, y0, x1, y1]}
         else:
             # 在框外较远处按下：重新框选（记住旧框，误触可恢复）
             self._crop_drag = {"mode": "new", "start": (event.x, event.y),
                                "rect": [event.x, event.y, event.x, event.y],
+                               "rect0": [event.x, event.y, event.x, event.y],
                                "prev_frac": self.crop_frac}
             self.crop_frac = None
             self._draw_drag_rect(canvas, event.x, event.y, event.x, event.y)
@@ -474,7 +482,9 @@ class App:
         if not self._crop_drag:
             return
         mode = self._crop_drag["mode"]
-        r = list(self._crop_drag["rect"])
+        r = list(self._crop_drag.get("rect0") or self._crop_drag["rect"])
+        if mode == "new":
+            r = list(self._crop_drag["rect"])
         d = self._pane_disp.get(id(self.preview_original))
         if not d:
             return
@@ -484,12 +494,14 @@ class App:
         mx = min(max(mx, ix), ix + iw)
         my = min(max(my, iy), iy + ih)
         if mode == "move":
+            # 绝对定位：以按下时的框为基准 + 总位移，1:1 跟手，无累加漂移
+            rect0 = self._crop_drag["rect0"]
             dx = mx - self._crop_drag["start"][0]
             dy = my - self._crop_drag["start"][1]
-            w = r[2] - r[0]
-            h = r[3] - r[1]
-            nx0 = min(max(r[0] + dx, ix), ix + iw - w)
-            ny0 = min(max(r[1] + dy, iy), iy + ih - h)
+            w = rect0[2] - rect0[0]
+            h = rect0[3] - rect0[1]
+            nx0 = min(max(rect0[0] + dx, ix), ix + iw - w)
+            ny0 = min(max(rect0[1] + dy, iy), iy + ih - h)
             r = [nx0, ny0, nx0 + w, ny0 + h]
         elif mode == "new":
             sx, sy = self._crop_drag["start"]
@@ -1067,10 +1079,12 @@ class App:
         quality = int(float(self.scale.get()))
         fmt = self._fmt_name()
         ext = next(e for _n, e, f, _a in OUT_FORMATS if f == fmt)
+        crop = self._crop_box_image()
+        angle = self.angle
         threading.Thread(target=self._worker, daemon=True,
-                         args=(fmt, ext, quality, params)).start()
+                         args=(fmt, ext, quality, params, crop, angle)).start()
 
-    def _worker(self, fmt, ext, quality, params):
+    def _worker(self, fmt, ext, quality, params, crop=None, angle=0.0):
         resize_mode, tw, th = params
         ok = fail = skip = 0
         if self.out_dir:
@@ -1083,7 +1097,8 @@ class App:
                         and os.path.splitext(src)[1].lower() == ext):
                     skip += 1
                 else:
-                    convert_one(src, dst, fmt, quality, resize_mode, tw, th)
+                    convert_one(src, dst, fmt, quality, resize_mode, tw, th,
+                                crop=crop, angle=angle)
                     ok += 1
             except Exception as e:
                 print(f"失败: {src} -> {e}", file=sys.stderr)
