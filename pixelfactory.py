@@ -1113,8 +1113,11 @@ class App:
     def _finished(self, ok, fail, skip):
         self.running = False
         self.convert_btn.config(state="normal")
-        self.status_var.set(f"完成  ✓{ok}  ✗{fail}  跳过{skip}")
-        messagebox.showinfo("完成", f"转换结束！\n成功 {ok} 个\n失败 {fail} 个\n跳过 {skip} 个")
+        if fail:
+            self.status_var.set(f"转换完成：成功 {ok}，失败 {fail}，跳过 {skip}")
+        else:
+            self.status_var.set(f"✓ 转换成功：{ok} 个" + (f"，跳过 {skip}" if skip else ""))
+        # 不弹系统对话框，结果只在状态栏显示
 
 
 def _dark_title_bar(root):
